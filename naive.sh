@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NaiveProxy 独立管理脚本 (for klzgrad/forwardproxy v2.11.2-naive)
-# 特性：零第三方脚本依赖、升级/改配不覆盖自定义 Caddy 路由、原生支持 SOCKS5 出站配置
+# 特性：零第三方脚本依赖、升级/改配不覆盖自定义 Caddy 路由、自动 socat 中转支持公网 SOCKS5 出站
 
 set -o pipefail
 
@@ -16,6 +16,8 @@ HTML_URL="${REPO_RAW}/html.tar.gz"
 AUTOCONFIG="/etc/caddy/.autoconfig"
 CADDY_JSON="/etc/caddy/caddy_config.json"
 SERVICE_FILE="/etc/systemd/system/naive.service"
+RELAY_SERVICE="/etc/systemd/system/naive-socks-relay.service"
+RELAY_PORT="10808"
 SCRIPT_PATH="/root/.naive.sh"
 
 # ======================== 终端输出 ========================
@@ -41,7 +43,7 @@ else
 fi
 
 case "$(uname -m)" in
-    x86_64|amd64)        ARCH="amd64" ;;
+    x86_64|amd64)         ARCH="amd64" ;;
     aarch64|arm64|armv8*) ARCH="arm64" ;;
     *) _red "不支持的架构: $(uname -m)"; exit 1 ;;
 esac
@@ -63,21 +65,22 @@ install_dependencies() {
         apt-get)
             DEBIAN_FRONTEND=noninteractive apt-get update -y
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                ca-certificates curl wget tar xz-utils jq libcap2-bin certbot cron
+                ca-certificates curl wget tar xz-utils jq socat libcap2-bin certbot cron
             ;;
         dnf)
-            dnf -y install ca-certificates curl wget tar xz jq libcap certbot cronie
+            dnf -y install ca-certificates curl wget tar xz jq socat libcap certbot cronie
             ;;
         yum)
             yum -y install epel-release || true
-            yum -y install ca-certificates curl wget tar xz jq libcap certbot cronie
+            yum -y install ca-certificates curl wget tar xz jq socat libcap certbot cronie
             ;;
     esac
 }
 
-ensure_jq() {
-    command -v jq >/dev/null 2>&1 && return 0
-    _yellow "未检测到 jq，正在自动安装..."
+ensure_tool() {
+    local bin="$1"
+    command -v "$bin" >/dev/null 2>&1 && return 0
+    _yellow "未检测到 ${bin}，正在自动安装..."
     install_dependencies
 }
 
@@ -108,7 +111,7 @@ port_80_busy() {
 }
 
 show_listen() {
-    ss -lntup 2>/dev/null | grep -E 'caddy|:443|:80' || true
+    ss -lntup 2>/dev/null | grep -E "caddy|socat|:443|:80|:${RELAY_PORT}" || true
 }
 
 # ======================== 配置读写与增量修补 ========================
@@ -139,9 +142,51 @@ get_current_upstream() {
     jq -r '.. | objects | select(.handler? == "forward_proxy") | .upstream // empty' "$CADDY_JSON" 2>/dev/null | head -n1
 }
 
+get_relay_target() {
+    [[ -f "$RELAY_SERVICE" ]] || return 0
+    grep -oE 'TCP:[^ ]+' "$RELAY_SERVICE" 2>/dev/null | head -n1 | sed 's/^TCP://'
+}
+
+setup_socks_relay() {
+    local target_host="$1" target_port="$2"
+    ensure_tool socat || return 1
+    cat > "$RELAY_SERVICE" <<EOF
+[Unit]
+Description=Local TCP Relay for NaiveProxy SOCKS5 Upstream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:${RELAY_PORT},bind=127.0.0.1,reuseaddr,fork TCP:${target_host}:${target_port}
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable naive-socks-relay >/dev/null 2>&1 || true
+    systemctl restart naive-socks-relay
+    sleep 1
+    if ! systemctl is-active --quiet naive-socks-relay; then
+        _red "本机 socat 中转服务启动失败："
+        journalctl -u naive-socks-relay -n 20 --no-pager
+        return 1
+    fi
+    return 0
+}
+
+remove_socks_relay() {
+    if [[ -f "$RELAY_SERVICE" ]] || systemctl is-active --quiet naive-socks-relay 2>/dev/null; then
+        systemctl disable --now naive-socks-relay >/dev/null 2>&1 || true
+        rm -f "$RELAY_SERVICE"
+        systemctl daemon-reload
+    fi
+}
+
 # 原子化增量修补 Caddy JSON（保留其他自定义路由 + 自动校验回滚）
 patch_caddy_json() {
-    ensure_jq || return 1
+    ensure_tool jq || return 1
     [[ -f "$CADDY_JSON" ]] || { _red "未找到 $CADDY_JSON"; return 1; }
 
     local tmp backup
@@ -410,10 +455,17 @@ show_config_info() {
     else
         _yellow "未找到 $AUTOCONFIG"
     fi
-    local up
+
+    local up relay_target
     up="$(get_current_upstream)"
+    relay_target="$(get_relay_target)"
     if [[ -n "$up" ]]; then
-        echo -e "SOCKS5 出站: ${green}${up}${none}"
+        echo -e "Caddy 出站:  ${green}${up}${none}"
+        if [[ -n "$relay_target" ]]; then
+            local r_stat
+            r_stat="$(systemctl is-active naive-socks-relay 2>/dev/null || echo inactive)"
+            echo -e "socat 中转:  ${cyan}127.0.0.1:${RELAY_PORT} -> ${relay_target}${none} (${r_stat})"
+        fi
     else
         echo "SOCKS5 出站: 未启用 (VPS 直出)"
     fi
@@ -473,7 +525,6 @@ update_caddy() {
         return 1
     fi
 
-    # 关键：先校验现有配置，通过则完全保留自定义路由，不覆盖！
     if [[ -f "$CADDY_JSON" ]] && /usr/bin/caddy validate --config "$CADDY_JSON" >/dev/null 2>&1; then
         _green "现有 Caddy 配置校验通过，已完整保留你的自定义路由与出站配置。"
     else
@@ -523,7 +574,6 @@ edit_config() {
     local auth
     auth="$(json_auth_credential "$new_user" "$new_pass")"
 
-    # 增量修改端口和认证凭据，不动其他自定义路由
     patch_caddy_json --arg port ":$new_port" --arg auth "$auth" '
         (if .apps.http.servers.srv0? then .apps.http.servers.srv0.listen = [$port] else . end)
         | (.. | objects | select(.handler? == "forward_proxy")) |= (.auth_credentials = [$auth])
@@ -537,14 +587,16 @@ edit_config() {
 }
 
 config_socks5() {
-    ensure_jq || return 1
+    ensure_tool jq || return 1
     [[ -f "$CADDY_JSON" ]] || { _red "未找到 Caddy 配置文件，请先安装。"; return 1; }
 
-    local cur
+    local cur relay_target
     cur="$(get_current_upstream)"
+    relay_target="$(get_relay_target)"
     echo
     _cyan "=========== SOCKS5 住宅出站配置 ==========="
-    echo "当前出站: ${cur:-未启用 (VPS 直出)}"
+    echo "Caddy 出站: ${cur:-未启用 (VPS 直出)}"
+    [[ -n "$relay_target" ]] && echo "实际转发目标: ${relay_target} (经 127.0.0.1:${RELAY_PORT})"
     echo "1) 设置 / 修改 SOCKS5 出站"
     echo "2) 清除 SOCKS5 出站（恢复 VPS 直出）"
     echo "0) 返回"
@@ -552,7 +604,7 @@ config_socks5() {
 
     case "$c" in
         1)
-            local s_host s_port s_user s_pass upstream_url
+            local s_host s_port s_user s_pass caddy_host caddy_port upstream_url
             read -r -p "SOCKS5 地址 (IP 或域名): " s_host
             [[ -n "$s_host" ]] || { _red "地址不能为空。"; return 1; }
             read -r -p "SOCKS5 端口: " s_port
@@ -560,9 +612,24 @@ config_socks5() {
             read -r -p "SOCKS5 用户名 (无认证直接回车): " s_user
             if [[ -n "$s_user" ]]; then
                 read -r -p "SOCKS5 密码: " s_pass
-                upstream_url="socks5://${s_user}:${s_pass}@${s_host}:${s_port}"
+            fi
+
+            # klzgrad/forwardproxy 仅允许 socks5 连接 localhost，公网地址自动启用本机 socat 中转
+            if [[ "$s_host" == "127.0.0.1" || "$s_host" == "localhost" ]]; then
+                remove_socks_relay
+                caddy_host="$s_host"
+                caddy_port="$s_port"
             else
-                upstream_url="socks5://${s_host}:${s_port}"
+                _cyan "检测到公网地址，正在配置本机 socat 中转 (127.0.0.1:${RELAY_PORT} -> ${s_host}:${s_port})..."
+                setup_socks_relay "$s_host" "$s_port" || return 1
+                caddy_host="127.0.0.1"
+                caddy_port="$RELAY_PORT"
+            fi
+
+            if [[ -n "$s_user" ]]; then
+                upstream_url="socks5://${s_user}:${s_pass}@${caddy_host}:${caddy_port}"
+            else
+                upstream_url="socks5://${caddy_host}:${caddy_port}"
             fi
 
             patch_caddy_json --arg up "$upstream_url" '
@@ -570,14 +637,15 @@ config_socks5() {
             ' || return 1
 
             start_and_verify || return 1
-            _green "已配置 SOCKS5 出站: $upstream_url"
+            _green "SOCKS5 出站已生效: ${s_host}:${s_port}"
             ;;
         2)
             patch_caddy_json '
                 (.. | objects | select(.handler? == "forward_proxy")) |= del(.upstream)
             ' || return 1
+            remove_socks_relay
             start_and_verify || return 1
-            _green "已清除 SOCKS5 出站，恢复为 VPS 直出。"
+            _green "已清除 SOCKS5 出站及本机中转，恢复为 VPS 直出。"
             ;;
         *) return 0 ;;
     esac
@@ -630,6 +698,7 @@ uninstall_naive() {
     read -r -p "确认卸载 NaiveProxy？(保留 Let's Encrypt 证书) [y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
     systemctl disable --now naive 2>/dev/null || true
+    remove_socks_relay
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
     (crontab -l 2>/dev/null | grep -vF '/etc/caddy/.renew.sh') | crontab - 2>/dev/null || true
